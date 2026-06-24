@@ -31,4 +31,11 @@ export type BackupAdapter = {
    * secrets embedded as fields inside an otherwise-included file are not handled.
    */
   secretExclude?: RegExp[];
+
+  /**
+   * Optional guidance appended to the "no state directories found" error, for
+   * adapters where the user must point the tool somewhere (e.g. Aider has no
+   * central dir and needs AIDER_PROJECTS).
+   */
+  noRootsHint?: string;
 };

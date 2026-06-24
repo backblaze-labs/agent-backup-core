@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { Cron } from "croner";
 import { createB2Client } from "./b2-client.js";
+import type { B2Client } from "./b2-client.js";
 import { gatherFiles } from "./gatherer.js";
 import { configFileExists, loadStandaloneConfig } from "./load-config.js";
 import { pullLatest } from "./pull.js";
@@ -30,6 +31,12 @@ const consoleLogger: Logger = {
 function userAgentFor(adapter: BackupAdapter): string {
   return `b2ai-${adapter.id}-backup`;
 }
+
+/** Factory for the B2 client. Overridable in tests to avoid real network calls. */
+export type ClientFactory = (config: StandaloneConfig, adapter: BackupAdapter) => Promise<B2Client>;
+
+const defaultClientFactory: ClientFactory = (config, adapter) =>
+  createB2Client(config.keyId, config.applicationKey, config.region, userAgentFor(adapter));
 
 function resolveSchedule(schedule: string | undefined): string {
   switch (schedule) {
@@ -127,12 +134,13 @@ export async function runOnce(
   adapter: BackupAdapter,
   config: StandaloneConfig,
   logger: Logger = consoleLogger,
+  clientFactory: ClientFactory = defaultClientFactory,
 ): Promise<void> {
   const ctx = buildContext(adapter, config, logger);
   if (ctx.roots.length === 0) {
-    throw new Error(`no ${adapter.id} state directories found — nothing to back up`);
+    throw new Error(`no ${adapter.id} state directories found — nothing to back up${adapter.noRootsHint ? `. ${adapter.noRootsHint}` : ""}`);
   }
-  const b2 = await createB2Client(config.keyId, config.applicationKey, config.region, userAgentFor(adapter));
+  const b2 = await clientFactory(config, adapter);
   await b2.headBucket(ctx.bucket); // fail fast on bad creds / missing bucket
   const release = acquireLock(adapter, ctx);
   try {
@@ -151,12 +159,13 @@ export async function runDaemon(
   adapter: BackupAdapter,
   config: StandaloneConfig,
   logger: Logger = consoleLogger,
+  clientFactory: ClientFactory = defaultClientFactory,
 ): Promise<void> {
   const ctx = buildContext(adapter, config, logger);
   if (ctx.roots.length === 0) {
-    throw new Error(`no ${adapter.id} state directories found — nothing to back up`);
+    throw new Error(`no ${adapter.id} state directories found — nothing to back up${adapter.noRootsHint ? `. ${adapter.noRootsHint}` : ""}`);
   }
-  const b2 = await createB2Client(config.keyId, config.applicationKey, config.region, userAgentFor(adapter));
+  const b2 = await clientFactory(config, adapter);
   await b2.headBucket(ctx.bucket);
   const release = acquireLock(adapter, ctx);
 
@@ -297,6 +306,7 @@ export async function runCli(
     loadStandaloneConfig(`${adapter.id}-b2-backup`),
   argv: string[] = process.argv.slice(2),
   logger: Logger = consoleLogger,
+  clientFactory: ClientFactory = defaultClientFactory,
 ): Promise<void> {
   const binName = `${adapter.id}-b2-backup`;
   const usage =
@@ -322,8 +332,8 @@ export async function runCli(
   }
   const config = await loadConfig();
   if (argv.includes("--once")) {
-    await runOnce(adapter, config, logger);
+    await runOnce(adapter, config, logger, clientFactory);
     return;
   }
-  await runDaemon(adapter, config, logger);
+  await runDaemon(adapter, config, logger, clientFactory);
 }

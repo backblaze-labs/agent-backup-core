@@ -6,6 +6,8 @@ const DEFAULT_USER_AGENT = "b2ai-agent-backup-core";
 export type B2Client = {
   putObject(bucket: string, key: string, body: Uint8Array, contentType: string): Promise<void>;
   getObject(bucket: string, key: string): Promise<Buffer>;
+  /** Server-side copy within a bucket (S3 PUT Copy) — no client-side bytes. */
+  copyObject(bucket: string, srcKey: string, destKey: string): Promise<void>;
   listObjects(bucket: string, prefix: string): Promise<B2ObjectEntry[]>;
   deleteObject(bucket: string, key: string): Promise<void>;
   headBucket(bucket: string): Promise<void>;
@@ -225,6 +227,19 @@ export async function createB2Client(
         throw new Error(`b2 getObject failed (${resp.status}): ${text}`);
       }
       return Buffer.from(await resp.arrayBuffer());
+    },
+
+    async copyObject(bucket, srcKey, destKey) {
+      const path = encodePath(`/${bucket}/${destKey}`);
+      // x-amz-copy-source is the (encoded) /bucket/key of the source; copies the
+      // stored bytes server-side, so an already-encrypted blob stays valid.
+      const copySource = encodePath(`/${bucket}/${srcKey}`);
+      const headers = sign("PUT", path, { host, "x-amz-copy-source": copySource });
+      const resp = await b2Fetch(`${endpoint}${path}`, { method: "PUT", headers }, "copyObject");
+      if (!resp.ok) {
+        const text = await resp.text().catch(() => "");
+        throw new Error(`b2 copyObject failed (${resp.status}): ${text}`);
+      }
     },
 
     async listObjects(bucket, prefix) {

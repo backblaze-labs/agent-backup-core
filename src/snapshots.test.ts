@@ -7,6 +7,7 @@ function createMockB2(objects: B2ObjectEntry[]): B2Client {
   return {
     putObject: vi.fn(),
     getObject: vi.fn(),
+    copyObject: vi.fn(),
     listObjects: vi.fn(async (_bucket: string, prefix: string) =>
       objects.filter((o) => o.key.startsWith(prefix)),
     ),

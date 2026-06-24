@@ -30,7 +30,7 @@ export {
   runDaemon,
   runOnce,
 } from "./standalone.js";
-export type { Logger } from "./standalone.js";
+export type { ClientFactory, Logger } from "./standalone.js";
 
 // Config loading (shared by every per-agent tool)
 export { configFileExists, loadStandaloneConfig, standaloneConfigPath } from "./load-config.js";

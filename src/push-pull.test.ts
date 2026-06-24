@@ -22,6 +22,11 @@ function memoryB2(): B2Client & { store: Map<string, Buffer> } {
       if (!v) throw new Error(`no such key: ${key}`);
       return v;
     },
+    async copyObject(_bucket, srcKey, destKey) {
+      const v = store.get(srcKey);
+      if (!v) throw new Error(`no such key: ${srcKey}`);
+      store.set(destKey, Buffer.from(v));
+    },
     async listObjects(_bucket, prefix) {
       const out: B2ObjectEntry[] = [];
       for (const [key, body] of store) {
@@ -117,5 +122,56 @@ describe("push → pull round-trip (multi-root, encrypted)", () => {
     const countAfterFirst = b2.store.size;
     await push(ctx, b2, logger);
     expect(b2.store.size).toBe(countAfterFirst); // no new snapshot dir
+  });
+});
+
+// Regression guard for the cross-snapshot restore bug: a snapshot after the
+// first must be self-contained, so restoring the LATEST snapshot recovers files
+// that were unchanged since an earlier snapshot (carried forward by copy).
+describe("push → pull restore of a later (incremental) snapshot", () => {
+  let base: string;
+  let dataDir: string;
+  let cacheDir: string;
+  let ctx: BackupContext;
+
+  beforeEach(async () => {
+    base = await fs.promises.mkdtemp(path.join(os.tmpdir(), "multi-snap-"));
+    dataDir = path.join(base, "data");
+    cacheDir = path.join(base, "cache");
+    await fs.promises.mkdir(dataDir, { recursive: true });
+    ctx = {
+      roots: [{ label: "data", dir: dataDir }],
+      bucket: "b",
+      prefix: "ms-backup",
+      cacheDir,
+      passphrase: "pp",
+      encrypt: true,
+      keepSnapshots: 10,
+      sqlite: [],
+      include: [/^data\//],
+      exclude: [],
+    };
+  });
+  afterEach(async () => {
+    await fs.promises.rm(base, { recursive: true, force: true });
+  });
+
+  it("restores the latest snapshot byte-for-byte after only one file changed", async () => {
+    const b2 = memoryB2();
+    await fs.promises.writeFile(path.join(dataDir, "stable.txt"), "unchanged-content");
+    await fs.promises.writeFile(path.join(dataDir, "volatile.txt"), "v1");
+    await push(ctx, b2, logger); // snapshot 1
+
+    // Change only volatile.txt and push a second snapshot.
+    await fs.promises.writeFile(path.join(dataDir, "volatile.txt"), "v2");
+    await push(ctx, b2, logger); // snapshot 2 — stable.txt is carried forward
+
+    // Wipe and restore the LATEST snapshot. stable.txt was never uploaded under
+    // snapshot 2's timestamp; it must have been copied forward.
+    await fs.promises.rm(dataDir, { recursive: true, force: true });
+    await pullLatest(ctx, b2, logger, { skipSafety: true });
+
+    expect(await fs.promises.readFile(path.join(dataDir, "stable.txt"), "utf-8")).toBe("unchanged-content");
+    expect(await fs.promises.readFile(path.join(dataDir, "volatile.txt"), "utf-8")).toBe("v2");
   });
 });

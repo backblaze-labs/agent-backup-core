@@ -1,6 +1,8 @@
 # @backblaze-labs/agent-backup-core
 
-Reusable engine for backing up an AI agent's local state to [Backblaze B2](https://www.backblaze.com/cloud-storage). It powers a family of small, independent per-agent backup tools (e.g. [`@backblaze-labs/goose-b2-backup`](https://github.com/backblaze-b2-samples/goose-b2-backup)).
+**Encrypted, incremental, off-site backups for your AI coding agent — powered by [Backblaze B2 cloud storage](https://blze.ai/storage).**
+
+Reusable engine for backing up an AI agent's local state to [Backblaze B2](https://www.backblaze.com/cloud-storage). It powers a family of small, independent per-agent backup tools (e.g. [`@backblaze-labs/goose-b2-backup`](https://github.com/backblaze-labs/goose-b2-backup)).
 
 You normally don't install this directly — you install a per-agent package that depends on it. Install this only to build a backup tool for a **new** agent.
 
@@ -51,6 +53,11 @@ Read this before deploying — it differs deliberately from the original OpenCla
 ## Requirements
 
 Node ≥ 22.5.0 (for the built-in `node:sqlite` backup API).
+
+## Learn more
+
+- [Backblaze B2 Cloud Storage](https://blze.ai/storage) — affordable, S3-compatible object storage
+- [agent-backup-core](https://github.com/backblaze-labs/agent-backup-core) — the shared backup engine powering this tool
 
 ## License
 

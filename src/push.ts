@@ -6,7 +6,7 @@ import { encrypt } from "./encryption.js";
 import { gatherFiles } from "./gatherer.js";
 import { readJsonFileWithFallback, writeJsonFileAtomically } from "./json-io.js";
 import { computeManifest, diffManifests, serializeManifest } from "./manifest.js";
-import { pruneSnapshots } from "./snapshots.js";
+import { getLatestSnapshot, pruneSnapshots } from "./snapshots.js";
 import { snapshotSqlite } from "./sqlite-snapshot.js";
 import type { BackupContext, BackupManifest } from "./types.js";
 
@@ -59,9 +59,12 @@ export async function push(
       sqliteFile.absolutePath = dest;
     }
 
-    // 3. Compute manifest (over the snapshotted, plaintext files).
+    // 3. Compute manifest (over the snapshotted, plaintext files). Keep
+    //    sub-second precision in the dir name so two pushes in the same second
+    //    (e.g. a scheduled push immediately followed by a shutdown push) can't
+    //    collide into one blended snapshot dir.
     const manifest = await computeManifest(files);
-    const timestamp = manifest.timestamp.replace(/:/g, "-").replace(/\.\d+Z$/, "Z");
+    const timestamp = manifest.timestamp.replace(/[:.]/g, "-");
 
     // 4. Load previous manifest for diffing (skip for one-off safety snapshots).
     let prevManifest: BackupManifest | null = null;
@@ -77,31 +80,60 @@ export async function push(
       logger.info("backup: no changes since last push");
       return;
     }
+    // Unchanged files still belong in THIS snapshot dir so it is self-contained
+    // and restorable on its own. Their bytes already live in the previous
+    // snapshot, so we server-side copy them forward instead of re-uploading.
+    const uploadSet = new Set(toUpload);
+    const toCopy = Object.keys(manifest.files).filter((p) => !uploadSet.has(p));
     logger.info(
-      `backup: pushing ${toUpload.length} files (${diff.added.length} added, ${diff.changed.length} changed, ${diff.deleted.length} deleted)`,
+      `backup: ${toUpload.length} uploaded (${diff.added.length} added, ${diff.changed.length} changed), ` +
+        `${toCopy.length} carried forward, ${diff.deleted.length} dropped`,
     );
 
-    // 6. Upload changed files (bounded concurrency). Index by path once — the
-    //    per-file linear scan was O(files × uploads).
     const byPath = new Map(files.map((f) => [f.relativePath, f]));
     const CONCURRENCY = 8;
-    for (let i = 0; i < toUpload.length; i += CONCURRENCY) {
-      const batch = toUpload.slice(i, i + CONCURRENCY);
-      await Promise.all(
-        batch.map(async (relativePath) => {
-          const file = byPath.get(relativePath);
-          if (!file) return;
-          let body: Uint8Array = await fs.promises.readFile(file.absolutePath);
-          if (ctx.encrypt) body = encrypt(Buffer.from(body), ctx.passphrase);
-          const key = `${prefix}/${timestamp}/${relativePath}`;
-          await b2.putObject(ctx.bucket, key, body, "application/octet-stream");
-          logger.debug?.(`backup: uploaded ${relativePath}`);
-        }),
-      );
-    }
+    const runBatched = async (items: string[], fn: (rel: string) => Promise<void>) => {
+      for (let i = 0; i < items.length; i += CONCURRENCY) {
+        await Promise.all(items.slice(i, i + CONCURRENCY).map(fn));
+      }
+    };
+    const uploadFile = async (relativePath: string) => {
+      const file = byPath.get(relativePath);
+      if (!file) return;
+      let body: Uint8Array = await fs.promises.readFile(file.absolutePath);
+      if (ctx.encrypt) body = encrypt(Buffer.from(body), ctx.passphrase);
+      await b2.putObject(ctx.bucket, `${prefix}/${timestamp}/${relativePath}`, body, "application/octet-stream");
+    };
 
-    // 7. Upload the manifest. Encrypted when encryption is on, since the file
-    //    inventory itself can leak repo names and conversation topics.
+    // 6a. Upload changed/added files from local.
+    await runBatched(toUpload, async (rel) => {
+      await uploadFile(rel);
+      logger.debug?.(`backup: uploaded ${rel}`);
+    });
+
+    // 6b. Carry unchanged files forward via server-side copy from the previous
+    //     snapshot. Falls back to a local upload if the copy fails for any
+    //     reason, so the snapshot is always complete regardless of copy support.
+    const prevTimestamp =
+      toCopy.length > 0 && !isSafetySnapshot
+        ? await getLatestSnapshot(b2, ctx.bucket, prefix)
+        : null;
+    await runBatched(toCopy, async (rel) => {
+      if (prevTimestamp) {
+        try {
+          await b2.copyObject(ctx.bucket, `${prefix}/${prevTimestamp}/${rel}`, `${prefix}/${timestamp}/${rel}`);
+          logger.debug?.(`backup: carried forward ${rel}`);
+          return;
+        } catch (err) {
+          logger.debug?.(`backup: copy-forward of ${rel} failed (${String(err)}), re-uploading`);
+        }
+      }
+      await uploadFile(rel);
+    });
+
+    // 7. Upload the manifest LAST (the completeness marker). Encrypted when
+    //    encryption is on, since the file inventory itself can leak repo names
+    //    and conversation topics.
     const manifestKey = `${prefix}/${timestamp}/manifest.json`;
     let manifestBody: Uint8Array = Buffer.from(serializeManifest(manifest), "utf-8");
     let manifestType = "application/json";

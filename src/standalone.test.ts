@@ -1,13 +1,19 @@
-import { describe, expect, it, vi } from "vitest";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { BackupAdapter } from "./adapter.js";
+import type { B2Client, B2ObjectEntry } from "./b2-client.js";
 import {
   acquireLock,
   buildContext,
   generateServiceUnit,
   resolvePassphrase,
+  runCli,
+  runOnce,
 } from "./standalone.js";
 import type { StandaloneConfig } from "./load-config.js";
-import type { Logger } from "./standalone.js";
+import type { ClientFactory, Logger } from "./standalone.js";
 
 const adapter: BackupAdapter = {
   id: "testagent",
@@ -103,5 +109,92 @@ describe("generateServiceUnit", () => {
   it("produces Task Scheduler instructions on win32", () => {
     const unit = generateServiceUnit(adapter, "testagent-b2-backup", "win32");
     expect(unit.content).toContain("schtasks");
+  });
+});
+
+// ─── Runtime: runOnce + runCli dispatch (in-memory B2, no network) ───────────
+
+function memoryB2(): B2Client & { store: Map<string, Buffer> } {
+  const store = new Map<string, Buffer>();
+  return {
+    store,
+    async putObject(_b, k, body) {
+      store.set(k, Buffer.from(body));
+    },
+    async getObject(_b, k) {
+      const v = store.get(k);
+      if (!v) throw new Error(`no such key: ${k}`);
+      return v;
+    },
+    async copyObject(_b, src, dest) {
+      const v = store.get(src);
+      if (!v) throw new Error(`no such key: ${src}`);
+      store.set(dest, Buffer.from(v));
+    },
+    async listObjects(_b, prefix) {
+      const out: B2ObjectEntry[] = [];
+      for (const [k, v] of store) if (k.startsWith(prefix)) out.push({ key: k, size: v.length, lastModified: "" });
+      return out;
+    },
+    async deleteObject(_b, k) {
+      store.delete(k);
+    },
+    async headBucket() {},
+  } as B2Client & { store: Map<string, Buffer> };
+}
+
+describe("runOnce (injected client)", () => {
+  let dir: string;
+  let cfg: StandaloneConfig;
+  let fileAdapter: BackupAdapter;
+
+  beforeEach(async () => {
+    dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "runonce-"));
+    await fs.promises.writeFile(path.join(dir, "note.txt"), "hello");
+    cfg = { keyId: "k", applicationKey: "ak", bucket: "b", encryptionKey: "pp", cacheDir: path.join(dir, ".cache") };
+    fileAdapter = {
+      id: `once-${process.pid}-${Date.now()}`,
+      resolveRoots: () => [{ label: "data", dir }],
+      include: [/^data\//],
+      exclude: [],
+      sqlite: [],
+    };
+  });
+  afterEach(async () => {
+    await fs.promises.rm(dir, { recursive: true, force: true });
+  });
+
+  it("pushes to the bucket and releases the lock", async () => {
+    const b2 = memoryB2();
+    const factory: ClientFactory = async () => b2;
+    await runOnce(fileAdapter, cfg, silentLogger(), factory);
+    const keys = [...b2.store.keys()];
+    expect(keys.some((k) => k.endsWith("data/note.txt"))).toBe(true);
+    expect(keys.some((k) => k.endsWith("manifest.json"))).toBe(true);
+    await expect(runOnce(fileAdapter, cfg, silentLogger(), factory)).resolves.toBeUndefined();
+  });
+});
+
+describe("runCli dispatch", () => {
+  const adapter: BackupAdapter = {
+    id: "cli",
+    resolveRoots: () => [],
+    include: [],
+    exclude: [],
+    sqlite: [],
+  };
+
+  it("prints usage on --help without loading config or a client", async () => {
+    const loadConfig = vi.fn();
+    const factory = vi.fn();
+    await runCli(adapter, loadConfig as never, ["--help"], silentLogger(), factory as never);
+    expect(loadConfig).not.toHaveBeenCalled();
+    expect(factory).not.toHaveBeenCalled();
+  });
+
+  it("rejects unknown flags before doing anything", async () => {
+    const loadConfig = vi.fn();
+    await expect(runCli(adapter, loadConfig as never, ["--bogus"], silentLogger())).rejects.toThrow(/unknown option/);
+    expect(loadConfig).not.toHaveBeenCalled();
   });
 });
