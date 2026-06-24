@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { B2Client, B2ObjectEntry } from "./b2-client.js";
 import { isEncrypted } from "./encryption.js";
@@ -51,7 +52,12 @@ describe("push → pull round-trip (multi-root, encrypted)", () => {
     cacheDir = path.join(base, "cache");
     await fs.promises.mkdir(path.join(dataDir, "sessions"), { recursive: true });
     await fs.promises.mkdir(configDir, { recursive: true });
-    await fs.promises.writeFile(path.join(dataDir, "sessions", "sessions.db"), "SQLITE-CONTENT");
+    // A real (WAL) SQLite DB so the snapshot path is genuinely exercised.
+    const db = new DatabaseSync(path.join(dataDir, "sessions", "sessions.db"));
+    db.exec("PRAGMA journal_mode = WAL");
+    db.exec("CREATE TABLE m (id INTEGER PRIMARY KEY, v TEXT)");
+    db.prepare("INSERT INTO m (v) VALUES (?)").run("hello");
+    db.close();
     await fs.promises.writeFile(path.join(configDir, "config.yaml"), "provider: openai");
     ctx = {
       roots: [
@@ -66,7 +72,10 @@ describe("push → pull round-trip (multi-root, encrypted)", () => {
       keepSnapshots: 10,
       sqlite: [/\.db$/],
       include: [/^data\//, /^config\//],
-      exclude: [],
+      // Exclude SQLite sidecars, exactly as every real adapter does — the .db is
+      // snapshotted, and the transient -wal/-shm must not be backed up or they
+      // churn the incremental diff.
+      exclude: [/-wal$/, /-shm$/],
     };
   });
 
@@ -93,9 +102,12 @@ describe("push → pull round-trip (multi-root, encrypted)", () => {
     await fs.promises.rm(configDir, { recursive: true, force: true });
     await pullLatest(ctx, b2, logger, { skipSafety: true });
 
-    const db = await fs.promises.readFile(path.join(dataDir, "sessions", "sessions.db"), "utf-8");
+    // The restored DB must be a valid SQLite file with the original row.
+    const restored = new DatabaseSync(path.join(dataDir, "sessions", "sessions.db"), { readOnly: true });
+    const row = restored.prepare("SELECT v FROM m WHERE id = 1").get() as { v: string };
+    restored.close();
+    expect(row.v).toBe("hello");
     const cfg = await fs.promises.readFile(path.join(configDir, "config.yaml"), "utf-8");
-    expect(db).toBe("SQLITE-CONTENT");
     expect(cfg).toBe("provider: openai");
   });
 

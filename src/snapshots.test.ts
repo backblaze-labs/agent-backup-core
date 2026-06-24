@@ -18,85 +18,85 @@ function createMockB2(objects: B2ObjectEntry[]): B2Client {
   } as unknown as B2Client & { _deleted: string[] };
 }
 
+/** A complete snapshot = a data file + a manifest.json under the timestamp dir. */
+function snapshot(prefix: string, ts: string): B2ObjectEntry[] {
+  return [
+    { key: `${prefix}/${ts}/data/file.txt`, size: 10, lastModified: "" },
+    { key: `${prefix}/${ts}/manifest.json`, size: 20, lastModified: "" },
+  ];
+}
+
 describe("snapshots", () => {
-  const prefix = "openclaw-backup";
+  const prefix = "agent-backup";
   const bucket = "test-bucket";
 
   describe("listSnapshots", () => {
-    it("extracts unique timestamps from object keys", async () => {
+    it("lists only complete (manifest-bearing) snapshots, sorted", async () => {
       const b2 = createMockB2([
-        { key: `${prefix}/2026-01-01T00-00-00Z/openclaw.json`, size: 10, lastModified: "" },
-        { key: `${prefix}/2026-01-01T00-00-00Z/manifest.json`, size: 20, lastModified: "" },
-        { key: `${prefix}/2026-01-02T00-00-00Z/openclaw.json`, size: 10, lastModified: "" },
-        { key: `${prefix}/2026-01-03T00-00-00Z/openclaw.json`, size: 10, lastModified: "" },
+        ...snapshot(prefix, "2026-01-03T00-00-00Z"),
+        ...snapshot(prefix, "2026-01-01T00-00-00Z"),
+        ...snapshot(prefix, "2026-01-02T00-00-00Z"),
       ]);
-
-      const snapshots = await listSnapshots(b2, bucket, prefix);
-      expect(snapshots).toEqual([
+      expect(await listSnapshots(b2, bucket, prefix)).toEqual([
         "2026-01-01T00-00-00Z",
         "2026-01-02T00-00-00Z",
         "2026-01-03T00-00-00Z",
       ]);
     });
 
-    it("returns empty array when no objects", async () => {
-      const b2 = createMockB2([]);
-      const snapshots = await listSnapshots(b2, bucket, prefix);
-      expect(snapshots).toEqual([]);
+    it("excludes a torn snapshot (files but no manifest)", async () => {
+      const b2 = createMockB2([
+        ...snapshot(prefix, "2026-01-01T00-00-00Z"),
+        { key: `${prefix}/2026-01-02T00-00-00Z/data/file.txt`, size: 10, lastModified: "" }, // no manifest
+      ]);
+      expect(await listSnapshots(b2, bucket, prefix)).toEqual(["2026-01-01T00-00-00Z"]);
     });
 
-    it("returns sorted timestamps", async () => {
+    it("excludes out-of-band safety snapshots", async () => {
       const b2 = createMockB2([
-        { key: `${prefix}/2026-01-03T00-00-00Z/file.txt`, size: 10, lastModified: "" },
-        { key: `${prefix}/2026-01-01T00-00-00Z/file.txt`, size: 10, lastModified: "" },
-        { key: `${prefix}/2026-01-02T00-00-00Z/file.txt`, size: 10, lastModified: "" },
+        ...snapshot(prefix, "2026-01-01T00-00-00Z"),
+        { key: `${prefix}/safety-2026-01-09T00-00-00Z/manifest.json`, size: 20, lastModified: "" },
       ]);
+      expect(await listSnapshots(b2, bucket, prefix)).toEqual(["2026-01-01T00-00-00Z"]);
+    });
 
-      const snapshots = await listSnapshots(b2, bucket, prefix);
-      expect(snapshots[0]).toBe("2026-01-01T00-00-00Z");
-      expect(snapshots[2]).toBe("2026-01-03T00-00-00Z");
+    it("returns empty array when no objects", async () => {
+      expect(await listSnapshots(createMockB2([]), bucket, prefix)).toEqual([]);
     });
   });
 
   describe("getLatestSnapshot", () => {
-    it("returns the latest timestamp", async () => {
+    it("returns the latest complete timestamp, ignoring a later safety snapshot", async () => {
       const b2 = createMockB2([
-        { key: `${prefix}/2026-01-01T00-00-00Z/file.txt`, size: 10, lastModified: "" },
-        { key: `${prefix}/2026-01-03T00-00-00Z/file.txt`, size: 10, lastModified: "" },
+        ...snapshot(prefix, "2026-01-01T00-00-00Z"),
+        ...snapshot(prefix, "2026-01-03T00-00-00Z"),
+        { key: `${prefix}/safety-2026-02-01T00-00-00Z/manifest.json`, size: 20, lastModified: "" },
       ]);
-
-      const latest = await getLatestSnapshot(b2, bucket, prefix);
-      expect(latest).toBe("2026-01-03T00-00-00Z");
+      expect(await getLatestSnapshot(b2, bucket, prefix)).toBe("2026-01-03T00-00-00Z");
     });
 
     it("returns null when no snapshots", async () => {
-      const b2 = createMockB2([]);
-      const latest = await getLatestSnapshot(b2, bucket, prefix);
-      expect(latest).toBeNull();
+      expect(await getLatestSnapshot(createMockB2([]), bucket, prefix)).toBeNull();
     });
   });
 
   describe("pruneSnapshots", () => {
     it("deletes oldest snapshots beyond keep count", async () => {
-      const objects = [
-        { key: `${prefix}/2026-01-01T00-00-00Z/file.txt`, size: 10, lastModified: "" },
-        { key: `${prefix}/2026-01-02T00-00-00Z/file.txt`, size: 10, lastModified: "" },
-        { key: `${prefix}/2026-01-03T00-00-00Z/file.txt`, size: 10, lastModified: "" },
-      ];
-      const b2 = createMockB2(objects);
-
+      const b2 = createMockB2([
+        ...snapshot(prefix, "2026-01-01T00-00-00Z"),
+        ...snapshot(prefix, "2026-01-02T00-00-00Z"),
+        ...snapshot(prefix, "2026-01-03T00-00-00Z"),
+      ]);
       const pruned = await pruneSnapshots(b2, bucket, prefix, 2);
       expect(pruned).toEqual(["2026-01-01T00-00-00Z"]);
       expect(b2.deleteObject).toHaveBeenCalled();
     });
 
     it("does nothing when within keep count", async () => {
-      const objects = [
-        { key: `${prefix}/2026-01-01T00-00-00Z/file.txt`, size: 10, lastModified: "" },
-        { key: `${prefix}/2026-01-02T00-00-00Z/file.txt`, size: 10, lastModified: "" },
-      ];
-      const b2 = createMockB2(objects);
-
+      const b2 = createMockB2([
+        ...snapshot(prefix, "2026-01-01T00-00-00Z"),
+        ...snapshot(prefix, "2026-01-02T00-00-00Z"),
+      ]);
       const pruned = await pruneSnapshots(b2, bucket, prefix, 5);
       expect(pruned).toEqual([]);
       expect(b2.deleteObject).not.toHaveBeenCalled();

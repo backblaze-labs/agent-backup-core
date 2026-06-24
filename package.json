@@ -1,6 +1,6 @@
 {
   "name": "@backblaze-labs/agent-backup-core",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Reusable engine for backing up an AI agent's local state to Backblaze B2: incremental SHA-256 diffing, AES-256-GCM encryption, WAL-safe SQLite snapshots, and a standalone backup runner.",
   "type": "module",
   "main": "dist/index.mjs",

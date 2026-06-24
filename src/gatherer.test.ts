@@ -72,6 +72,18 @@ describe("gatherFiles (multi-root)", () => {
     expect(rels.some((r) => r.includes("models"))).toBe(false); // not in include
   });
 
+  it("prunes excluded directories instead of descending into them", async () => {
+    // A file buried inside an excluded dir must not be collected.
+    await fs.promises.mkdir(path.join(dataDir, "models", "deep"), { recursive: true });
+    await fs.promises.writeFile(path.join(dataDir, "models", "deep", "weights.bin"), "X");
+    const files = await gatherFiles(roots, {
+      include: [/^data\//],
+      exclude: [/^data\/models\//],
+    });
+    expect(files.some((f) => f.relativePath.includes("models"))).toBe(false);
+    expect(files.some((f) => f.relativePath === "data/sessions/sessions.db")).toBe(true);
+  });
+
   it("maps virtual paths back to absolute paths", () => {
     expect(resolveRelativePath("data/sessions/sessions.db", roots)).toBe(
       path.join(dataDir, "sessions", "sessions.db"),

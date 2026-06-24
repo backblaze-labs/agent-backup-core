@@ -81,13 +81,15 @@ export async function push(
       `backup: pushing ${toUpload.length} files (${diff.added.length} added, ${diff.changed.length} changed, ${diff.deleted.length} deleted)`,
     );
 
-    // 6. Upload changed files (bounded concurrency).
+    // 6. Upload changed files (bounded concurrency). Index by path once — the
+    //    per-file linear scan was O(files × uploads).
+    const byPath = new Map(files.map((f) => [f.relativePath, f]));
     const CONCURRENCY = 8;
     for (let i = 0; i < toUpload.length; i += CONCURRENCY) {
       const batch = toUpload.slice(i, i + CONCURRENCY);
       await Promise.all(
         batch.map(async (relativePath) => {
-          const file = files.find((f) => f.relativePath === relativePath);
+          const file = byPath.get(relativePath);
           if (!file) return;
           let body: Uint8Array = await fs.promises.readFile(file.absolutePath);
           if (ctx.encrypt) body = encrypt(Buffer.from(body), ctx.passphrase);

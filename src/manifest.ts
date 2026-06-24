@@ -54,7 +54,14 @@ export function serializeManifest(manifest: BackupManifest): string {
 }
 
 export function deserializeManifest(data: string): BackupManifest {
-  return JSON.parse(data) as BackupManifest;
+  const manifest = JSON.parse(data) as BackupManifest;
+  // Guard against silently mis-reading a future on-disk format.
+  if (manifest.version !== 1) {
+    throw new Error(
+      `unsupported backup manifest version ${String((manifest as { version?: unknown }).version)} — upgrade @backblaze-labs/agent-backup-core`,
+    );
+  }
+  return manifest;
 }
 
 async function hashFile(filePath: string): Promise<string> {

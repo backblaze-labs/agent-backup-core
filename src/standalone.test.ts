@@ -6,7 +6,8 @@ import {
   generateServiceUnit,
   resolvePassphrase,
 } from "./standalone.js";
-import type { Logger, StandaloneConfig } from "./standalone.js";
+import type { StandaloneConfig } from "./load-config.js";
+import type { Logger } from "./standalone.js";
 
 const adapter: BackupAdapter = {
   id: "testagent",

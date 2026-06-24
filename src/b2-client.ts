@@ -1,6 +1,7 @@
 import crypto from "node:crypto";
 
-const USER_AGENT = "agent-backup-core";
+/** Default attribution token; per-tool callers override with `b2ai-<tool>`. */
+const DEFAULT_USER_AGENT = "b2ai-agent-backup-core";
 
 export type B2Client = {
   putObject(bucket: string, key: string, body: Uint8Array, contentType: string): Promise<void>;
@@ -34,6 +35,27 @@ function hmacSha256(key: Buffer | string, data: string): Buffer {
 
 function sha256Hex(data: Uint8Array | ""): string {
   return crypto.createHash("sha256").update(data).digest("hex");
+}
+
+/**
+ * RFC 3986 percent-encoding for a single path segment. `encodeURIComponent`
+ * leaves `!'()*` unescaped, which AWS SigV4 requires encoded.
+ */
+function encodeSegment(s: string): string {
+  return encodeURIComponent(s).replace(
+    /[!'()*]/g,
+    (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`,
+  );
+}
+
+/**
+ * Encode an absolute object path for both the SigV4 canonical request and the
+ * request URL, preserving `/` separators. Without this, a key containing a
+ * space (common in agent state) is signed literally but sent percent-encoded by
+ * `fetch`, yielding SignatureDoesNotMatch.
+ */
+export function encodePath(path: string): string {
+  return path.split("/").map(encodeSegment).join("/");
 }
 
 function getSignatureKey(
@@ -73,6 +95,7 @@ function signRequest(params: S3SignParams): Record<string, string> {
         .join("&")
     : "";
 
+  // `path` is expected to already be RFC-3986 encoded by the caller (encodePath).
   const canonicalRequest = [
     method,
     path,
@@ -104,16 +127,61 @@ function signRequest(params: S3SignParams): Record<string, string> {
   };
 }
 
-export { signRequest as _signRequest, parseListObjectsResponse as _parseListObjectsResponse };
+export {
+  signRequest as _signRequest,
+  parseListObjectsResponse as _parseListObjectsResponse,
+  encodePath as _encodePath,
+};
+
+// ─── Transient-failure handling ───────────────────────────────────────────────
+// A scheduled backup daemon must survive blips: bound each request with a timeout
+// and retry 429/5xx and network errors with exponential backoff + jitter.
+
+const REQUEST_TIMEOUT_MS = 60_000;
+const MAX_ATTEMPTS = 4;
+
+function backoffMs(attempt: number): number {
+  const base = Math.min(500 * 2 ** (attempt - 1), 8_000);
+  return base + Math.floor(Math.random() * 250); // jitter to avoid thundering herd
+}
+
+const delay = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
+async function b2Fetch(url: string, init: RequestInit, label: string): Promise<Response> {
+  let lastErr: unknown;
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    const ac = new AbortController();
+    const timer = setTimeout(() => ac.abort(), REQUEST_TIMEOUT_MS);
+    try {
+      const resp = await fetch(url, { ...init, signal: ac.signal });
+      if ((resp.status === 429 || resp.status >= 500) && attempt < MAX_ATTEMPTS) {
+        await delay(backoffMs(attempt));
+        continue;
+      }
+      return resp;
+    } catch (err) {
+      lastErr = err;
+      if (attempt < MAX_ATTEMPTS) {
+        await delay(backoffMs(attempt));
+        continue;
+      }
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+  throw new Error(`b2 ${label}: request failed after ${MAX_ATTEMPTS} attempts: ${String(lastErr)}`);
+}
 
 export async function createB2Client(
   keyId: string,
   applicationKey: string,
   region?: string,
+  userAgent: string = DEFAULT_USER_AGENT,
 ): Promise<B2Client> {
   // Authorize with B2 to discover the region if not provided.
-  const resolvedRegion = region ?? (await discoverRegion(keyId, applicationKey));
+  const resolvedRegion = region ?? (await discoverRegion(keyId, applicationKey, userAgent));
   const endpoint = `https://s3.${resolvedRegion}.backblazeb2.com`;
+  const host = new URL(endpoint).host;
 
   const sign = (
     method: string,
@@ -126,7 +194,7 @@ export async function createB2Client(
       method,
       path,
       query,
-      headers: { ...headers, "user-agent": USER_AGENT },
+      headers: { ...headers, "user-agent": userAgent },
       body,
       region: resolvedRegion,
       accessKeyId: keyId,
@@ -135,13 +203,13 @@ export async function createB2Client(
 
   return {
     async putObject(bucket, key, body, contentType) {
-      const path = `/${bucket}/${key}`;
-      const headers = sign("PUT", path, { host: new URL(endpoint).host, "content-type": contentType }, body);
-      const resp = await fetch(`${endpoint}${path}`, {
-        method: "PUT",
-        headers,
-        body: new Uint8Array(body),
-      });
+      const path = encodePath(`/${bucket}/${key}`);
+      const headers = sign("PUT", path, { host, "content-type": contentType }, body);
+      const resp = await b2Fetch(
+        `${endpoint}${path}`,
+        { method: "PUT", headers, body: new Uint8Array(body) },
+        "putObject",
+      );
       if (!resp.ok) {
         const text = await resp.text().catch(() => "");
         throw new Error(`b2 putObject failed (${resp.status}): ${text}`);
@@ -149,12 +217,9 @@ export async function createB2Client(
     },
 
     async getObject(bucket, key) {
-      const path = `/${bucket}/${key}`;
-      const headers = sign("GET", path, { host: new URL(endpoint).host });
-      const resp = await fetch(`${endpoint}${path}`, {
-        method: "GET",
-        headers,
-      });
+      const path = encodePath(`/${bucket}/${key}`);
+      const headers = sign("GET", path, { host });
+      const resp = await b2Fetch(`${endpoint}${path}`, { method: "GET", headers }, "getObject");
       if (!resp.ok) {
         const text = await resp.text().catch(() => "");
         throw new Error(`b2 getObject failed (${resp.status}): ${text}`);
@@ -175,15 +240,16 @@ export async function createB2Client(
         if (continuationToken) {
           query["continuation-token"] = continuationToken;
         }
-        const reqPath = `/${bucket}`;
-        const headers = sign("GET", reqPath, { host: new URL(endpoint).host }, "", query);
+        const reqPath = encodePath(`/${bucket}`);
+        const headers = sign("GET", reqPath, { host }, "", query);
         const qs = Object.entries(query)
           .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`)
           .join("&");
-        const resp = await fetch(`${endpoint}${reqPath}?${qs}`, {
-          method: "GET",
-          headers,
-        });
+        const resp = await b2Fetch(
+          `${endpoint}${reqPath}?${qs}`,
+          { method: "GET", headers },
+          "listObjects",
+        );
         if (!resp.ok) {
           const text = await resp.text().catch(() => "");
           throw new Error(`b2 listObjects failed (${resp.status}): ${text}`);
@@ -198,12 +264,9 @@ export async function createB2Client(
     },
 
     async deleteObject(bucket, key) {
-      const path = `/${bucket}/${key}`;
-      const headers = sign("DELETE", path, { host: new URL(endpoint).host });
-      const resp = await fetch(`${endpoint}${path}`, {
-        method: "DELETE",
-        headers,
-      });
+      const path = encodePath(`/${bucket}/${key}`);
+      const headers = sign("DELETE", path, { host });
+      const resp = await b2Fetch(`${endpoint}${path}`, { method: "DELETE", headers }, "deleteObject");
       if (!resp.ok) {
         const text = await resp.text().catch(() => "");
         throw new Error(`b2 deleteObject failed (${resp.status}): ${text}`);
@@ -211,24 +274,40 @@ export async function createB2Client(
     },
 
     async headBucket(bucket) {
-      const path = `/${bucket}`;
-      const headers = sign("HEAD", path, { host: new URL(endpoint).host });
-      const resp = await fetch(`${endpoint}${path}`, {
-        method: "HEAD",
-        headers,
-      });
+      // List a single key rather than HEAD the bucket: it exercises the exact
+      // permission a backup needs (object read on this prefix) and works with
+      // single-bucket-scoped keys, which HeadBucket can reject.
+      const path = encodePath(`/${bucket}`);
+      const query = { "list-type": "2", "max-keys": "1" };
+      const headers = sign("GET", path, { host }, "", query);
+      const qs = Object.entries(query)
+        .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`)
+        .join("&");
+      const resp = await b2Fetch(`${endpoint}${path}?${qs}`, { method: "GET", headers }, "headBucket");
       if (!resp.ok) {
-        throw new Error(`b2 headBucket failed (${resp.status})`);
+        const hint =
+          resp.status === 403
+            ? " — check the application key has access to this bucket"
+            : resp.status === 404
+              ? " — bucket not found (wrong name or region?)"
+              : "";
+        throw new Error(`b2 bucket access check failed (${resp.status})${hint}`);
       }
     },
   };
 }
 
-async function discoverRegion(keyId: string, applicationKey: string): Promise<string> {
+async function discoverRegion(
+  keyId: string,
+  applicationKey: string,
+  userAgent: string,
+): Promise<string> {
   const auth = Buffer.from(`${keyId}:${applicationKey}`).toString("base64");
-  const resp = await fetch("https://api.backblazeb2.com/b2api/v3/b2_authorize_account", {
-    headers: { authorization: `Basic ${auth}`, "user-agent": USER_AGENT },
-  });
+  const resp = await b2Fetch(
+    "https://api.backblazeb2.com/b2api/v3/b2_authorize_account",
+    { headers: { authorization: `Basic ${auth}`, "user-agent": userAgent } },
+    "authorize",
+  );
   if (!resp.ok) {
     const text = await resp.text().catch(() => "");
     throw new Error(`b2 authorize failed (${resp.status}): ${text}`);
@@ -251,13 +330,23 @@ type ListObjectsPage = {
   nextToken: string | undefined;
 };
 
+/** Decode the five predefined XML entities (order matters: &amp; last). */
+function decodeXmlEntities(s: string): string {
+  return s
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&amp;/g, "&");
+}
+
 function parseListObjectsResponse(xml: string): ListObjectsPage {
   const entries: B2ObjectEntry[] = [];
   const contentRegex = /<Contents>([\s\S]*?)<\/Contents>/g;
   let match: RegExpExecArray | null;
   while ((match = contentRegex.exec(xml)) !== null) {
     const block = match[1]!;
-    const key = block.match(/<Key>(.*?)<\/Key>/)?.[1] ?? "";
+    const key = decodeXmlEntities(block.match(/<Key>(.*?)<\/Key>/)?.[1] ?? "");
     const size = Number(block.match(/<Size>(.*?)<\/Size>/)?.[1] ?? "0");
     const lastModified = block.match(/<LastModified>(.*?)<\/LastModified>/)?.[1] ?? "";
     entries.push({ key, size, lastModified });
@@ -265,7 +354,7 @@ function parseListObjectsResponse(xml: string): ListObjectsPage {
 
   const isTruncated = /<IsTruncated>true<\/IsTruncated>/.test(xml);
   const nextToken = isTruncated
-    ? xml.match(/<NextContinuationToken>(.*?)<\/NextContinuationToken>/)?.[1]
+    ? decodeXmlEntities(xml.match(/<NextContinuationToken>(.*?)<\/NextContinuationToken>/)?.[1] ?? "")
     : undefined;
 
   return { entries, nextToken };

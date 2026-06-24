@@ -13,6 +13,13 @@ function matchesAny(relativePath: string, patterns: RegExp[]): boolean {
   return patterns.some((p) => p.test(relativePath));
 }
 
+/** Whether a directory (trailing-slash path) is wholly excluded, so the walk can skip it. */
+function isExcludedDir(dirPath: string, patterns: GatherPatterns): boolean {
+  if (matchesAny(dirPath, patterns.exclude)) return true;
+  if (patterns.secretExclude && matchesAny(dirPath, patterns.secretExclude)) return true;
+  return false;
+}
+
 /**
  * Decide whether a virtual relative path (label-prefixed) belongs in the backup.
  * Exclusions — including secret exclusions — always win over inclusions.
@@ -54,6 +61,13 @@ async function walkDir(
   for (const entry of entries) {
     const fullPath = path.join(dir, entry.name);
     if (entry.isDirectory()) {
+      // Prune excluded subtrees instead of walking them — avoids statting every
+      // file under huge, always-excluded dirs (node_modules, .venv, Cline's
+      // multi-GB git checkpoints). Test the dir path with a trailing slash so
+      // prefix-style exclude patterns (e.g. /checkpoints\//) match.
+      const within = path.relative(root.dir, fullPath).split(path.sep).join("/");
+      const dirPath = `${root.label}/${within}/`;
+      if (isExcludedDir(dirPath, patterns)) continue;
       await walkDir(root, fullPath, patterns, results);
     } else if (entry.isFile()) {
       const within = path.relative(root.dir, fullPath).split(path.sep).join("/");
