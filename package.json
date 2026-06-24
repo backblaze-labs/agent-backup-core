@@ -1,0 +1,48 @@
+{
+  "name": "@backblaze-labs/agent-backup-core",
+  "version": "0.1.0",
+  "description": "Reusable engine for backing up an AI agent's local state to Backblaze B2: incremental SHA-256 diffing, AES-256-GCM encryption, WAL-safe SQLite snapshots, and a standalone backup runner.",
+  "type": "module",
+  "main": "dist/index.mjs",
+  "types": "dist/index.d.mts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.mts",
+      "import": "./dist/index.mjs"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsdown src/index.ts --format esm --dts --out-dir dist",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "croner": "^10.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsdown": "^0.20.0",
+    "typescript": "^5.9.0",
+    "vitest": "^4.0.0"
+  },
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "keywords": [
+    "backblaze",
+    "b2",
+    "backup",
+    "ai-agent",
+    "sqlite",
+    "encryption"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/backblaze-b2-samples/agent-backup-core"
+  }
+}
