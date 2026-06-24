@@ -54,6 +54,48 @@ Read this before deploying — it differs deliberately from the original OpenCla
 
 Node ≥ 22.5.0 (for the built-in `node:sqlite` backup API).
 
+## FAQ
+
+**Should I install this directly?**
+
+Usually not. Install a per-agent package (e.g. `@backblaze-labs/goose-b2-backup`) that depends on this. Install the core only to build a backup tool for a **new** agent.
+
+**How do I add support for a new agent?**
+
+Write a `BackupAdapter` — pure data: an `id`, a `resolveRoots(env)` function, and `include`/`exclude`/`sqlite`/`secretExclude` regex arrays — then wire it with a one-line bin: `runCli(myAdapter)`. See the README example.
+
+**How is encryption handled?**
+
+AES-256-GCM with a per-file random salt and IV, scrypt-derived key. The passphrase (`encryptionKey`) is deliberately separate from B2 credentials so a leaked bucket key can't decrypt backups.
+
+**How are backups kept incremental but still restorable?**
+
+Each push uploads only changed files and server-side-copies unchanged ones into the new snapshot, so every snapshot is self-contained. The manifest is hashed (and encrypted) to drive the diff and verify restores.
+
+**How are live SQLite databases handled?**
+
+Via `node:sqlite`'s online `backup()` API (with a copy fallback), so a WAL-mode database snapshots consistently while the agent is using it. Adapters declare which files are SQLite via the `sqlite` patterns.
+
+**Why Node >= 22.5?**
+
+The WAL-safe SQLite snapshot relies on the built-in `node:sqlite` module's backup API, available from Node 22.5. This is an experimental Node API, so it may emit an experimental-feature warning.
+
+**Does it support multiple source directories?**
+
+Yes — an adapter can return several roots (e.g. Goose's config/data/state), each labeled; the engine mirrors them into one namespace and restores them correctly.
+
+**How does the standalone daemon behave?**
+
+`runDaemon` takes a single-instance lock, auto-restores on first run if local state is empty, backs up immediately, then on schedule, coalesces overlapping runs, and does a final backup on shutdown.
+
+**Can I exclude secrets from a backup?**
+
+Adapters can list `secretExclude` patterns for files that should never leave the machine. Note this is path-level only — secrets embedded *inside* an included file can't be isolated this way, so rely on encryption there.
+
+**Is it tied to Backblaze only?**
+
+The client speaks the S3-compatible API against Backblaze B2. See [blze.ai/storage](https://blze.ai/storage) for B2.
+
 ## Learn more
 
 - [Backblaze B2 Cloud Storage](https://blze.ai/storage) — affordable, S3-compatible object storage
